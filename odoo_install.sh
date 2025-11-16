@@ -370,10 +370,10 @@ upstream odoo {
 upstream odoochat {
   server 127.0.0.1:$LONGPOLLING_PORT;
 }
-# map \$http_upgrade \$connection_upgrade {
-#   default upgrade;
-#   ''      close;
-# }
+map \$http_upgrade \$connection_upgrade {
+  default upgrade;
+  ''      close;
+}
 
 # # http -> https
 server {
