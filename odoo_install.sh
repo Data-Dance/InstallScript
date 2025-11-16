@@ -127,7 +127,7 @@ sudo apt-get install git python3-cffi build-essential wget python3-dev python3-v
 #--------------------------------------------------
 echo -e "\n--- Installing Python 3 + pip3 --"
 # Path to the virtual environment
-venv_path="/$OE_HOME/venv"
+venv_path="$OE_HOME/venv"
 #Create a new Python virtual environment for Odoo
 sudo su $OE_USER -c "python3 -m venv $venv_path"
 
@@ -340,7 +340,7 @@ SyslogIdentifier=$OE_USER
 PermissionsStartOnly=true
 User=$OE_USER
 Group=$OE_USER
-ExecStart=$OE_HOME/$OE_USER-venv/bin/python3 $OE_HOME/$OE_CONFIG/odoo-bin -c /etc/$OE_CONFIG.conf
+ExecStart=$OE_HOME/venv/bin/python3 $OE_HOME/$OE_CONFIG/odoo-bin -c /etc/$OE_CONFIG.conf
 StandardOutput=journal+console
 Restart=always
 RestartSec=5
