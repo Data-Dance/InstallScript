@@ -122,15 +122,6 @@ sudo apt-get install -y python3 python3-pip
 sudo apt-get install git python3-cffi build-essential wget python3-dev python3-venv python3-wheel libxslt-dev libzip-dev libldap2-dev libsasl2-dev python3-setuptools node-less libpng-dev libjpeg-dev gdebi -y
 
 
-#--------------------------------------------------
-# Install Dependencies of ODOO
-#--------------------------------------------------
-echo -e "\n--- Installing Python 3 + pip3 --"
-# Path to the virtual environment
-venv_path="$OE_HOME/venv"
-#Create a new Python virtual environment for Odoo
-sudo su $OE_USER -c "python3 -m venv $venv_path"
-
 echo -e "\n---- Installing nodeJS NPM and rtlcss for LTR support ----"
 sudo apt-get install nodejs npm -y
 sudo npm install -g rtlcss
@@ -171,6 +162,16 @@ sudo adduser $OE_USER sudo
 echo -e "\n---- Create Log directory ----"
 sudo mkdir /var/log/$OE_USER
 sudo chown $OE_USER:$OE_USER /var/log/$OE_USER
+
+#--------------------------------------------------
+# Install Dependencies of ODOO
+#--------------------------------------------------
+echo -e "\n--- Installing Python 3 + pip3 --"
+# Path to the virtual environment
+venv_path="$OE_HOME/venv"
+#Create a new Python virtual environment for Odoo
+sudo su $OE_USER -c "python3 -m venv $venv_path"
+
 
 #--------------------------------------------------
 # Install ODOO
@@ -364,10 +365,10 @@ if [ $INSTALL_NGINX = "True" ]; then
 
   if [ $OE_VERSION > "15.0" ];then
     cat <<EOF > ~/odoo
-upstream odoo {
+upstream $OE_USER {
   server 127.0.0.1:$OE_PORT;
 }
-upstream odoochat {
+upstream $OE_USER-chat {
   server 127.0.0.1:$LONGPOLLING_PORT;
 }
 map \$http_upgrade \$connection_upgrade {
@@ -403,7 +404,7 @@ server {
 
   # Redirect websocket requests to odoo gevent port
   location /websocket {
-    proxy_pass http://odoochat;
+    proxy_pass http://$OE_USER-chat;
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection \$connection_upgrade;
     proxy_set_header X-Forwarded-Host \$http_host;
@@ -423,7 +424,7 @@ server {
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_redirect off;
-    proxy_pass http://odoo;
+    proxy_pass http://$OE_USER;
 
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains";
     proxy_cookie_flags session_id samesite=lax secure;  # requires nginx 1.19.8
