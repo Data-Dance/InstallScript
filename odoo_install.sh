@@ -40,6 +40,15 @@ OE_CONFIG="${OE_USER}-server"
 WEBSITE_NAME="_"
 # Set the default Odoo longpolling port (you still have to use -c /etc/odoo-server.conf for example to use this.)
 LONGPOLLING_PORT="8072"
+# Number of Odoo worker processes. "auto" sizes it from CPU count and RAM;
+# set a number to pin it. 0 means single-threaded -- development only.
+OE_WORKERS="auto"
+# Serve only one database and disable the web database manager. Strongly
+# recommended for anything reachable from the internet.
+LOCK_DATABASE="True"
+# The database this instance serves. Used for db_name/dbfilter when
+# LOCK_DATABASE is True; leave empty to skip the restriction.
+OE_DB_NAME="$OE_USER"
 # Set to "True" to install certbot and have ssl enabled, "False" to use http
 ENABLE_SSL="True"
 # Provide Email to register ssl certificate
@@ -53,6 +62,17 @@ pip_install() {
     sudo -H pip3 install "$@"
   fi
 }
+
+# Return true when version $1 is strictly newer than version $2.
+#
+# Do not write `[ $OE_VERSION > "15.0" ]`: inside [ ], `>` is the shell's
+# output REDIRECTION operator, not a comparison. That form silently creates an
+# empty file named "15.0" in the current directory and reduces the test to
+# `[ $OE_VERSION ]`, i.e. "is the string non-empty" -- always true. It happened
+# to pick the right branch for 18.0/19.0 while being wrong for 11.0 and 15.0.
+version_gt() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
 ##
 ###  WKHTMLTOPDF download links
 ## === Ubuntu Trusty x64 & x32 === (for other distributions please replace these two links,
@@ -60,16 +80,27 @@ pip_install() {
 ## https://github.com/odoo/odoo/wiki/Wkhtmltopdf ):
 ## https://www.odoo.com/documentation/19.0/administration/install.html
 
-# Check if the operating system is Ubuntu 24.04
-if [[ $(lsb_release -r -s) == "24.04" ]]; then
-    WKHTMLTOX_X64="https://packages.ubuntu.com/jammy/wkhtmltopdf"
-    WKHTMLTOX_X32="https://packages.ubuntu.com/jammy/wkhtmltopdf"
-    #No Same link works for both 64 and 32-bit on Ubuntu 24.04
-else
-    # For older versions of Ubuntu
-    WKHTMLTOX_X64="https://github.com/wkhtmltopdf/wkhtmltopdf/releases/download/0.12.5/wkhtmltox_0.12.5-1.$(lsb_release -c -s)_amd64.deb"
-    WKHTMLTOX_X32="https://github.com/wkhtmltopdf/wkhtmltopdf/releases/download/0.12.5/wkhtmltox_0.12.5-1.$(lsb_release -c -s)_i386.deb"
-fi
+# Odoo needs the 0.12.6 build "with patched qt" -- the plain build renders
+# headers and footers incorrectly. Two things make this awkward:
+#
+#   * Ubuntu dropped wkhtmltopdf from its archive; there is no candidate at all
+#     on 26.04 (`apt-cache policy wkhtmltopdf` shows none), so "apt install
+#     wkhtmltopdf" is not a fallback on current releases.
+#   * The upstream project is archived, so jammy (22.04) is the newest Ubuntu
+#     build ever published. It installs cleanly on later releases -- its
+#     dependencies (xfonts-*, libfontenc1) are all still in the archive.
+#
+# So: try the build matching this release, then walk back to the newest builds
+# that exist. Do NOT pin a single release here -- the previous version tested
+# for exactly "24.04" and therefore produced a URL like
+# wkhtmltox_0.12.5-1.resolute_amd64.deb on 26.04, which has never existed.
+WKHTMLTOPDF_VERSION="0.12.6.1-3"
+WKHTMLTOPDF_BASE="https://github.com/wkhtmltopdf/packaging/releases/download/${WKHTMLTOPDF_VERSION}"
+# Verified 2026-08-17: of the 0.12.6.1-3 assets, "jammy" is the only Ubuntu
+# build still published (focal and the current codename both 404), so it is the
+# single real fallback. Keep the running release first in case a newer build
+# ever appears.
+WKHTMLTOPDF_CODENAMES="$(lsb_release -c -s) jammy"
 
 #--------------------------------------------------
 # Update Server
@@ -130,26 +161,45 @@ sudo npm install -g rtlcss
 # Install Wkhtmltopdf if needed
 #--------------------------------------------------
 if [ "$INSTALL_WKHTMLTOPDF" = "True" ]; then
-  echo -e "\n---- Install wkhtml and place shortcuts on correct place for ODOO 13 ----"
-  #pick up correct one from x64 & x32 versions:
-  if [ "`getconf LONG_BIT`" == "64" ];then
-      _url=$WKHTMLTOX_X64
-  else
-      _url=$WKHTMLTOX_X32
-  fi
-  sudo wget $_url
-  
+  echo -e "\n---- Install wkhtmltopdf ----"
+  _arch=$(dpkg --print-architecture)
+  _wkhtml_ok="False"
 
-  if [[ $(lsb_release -r -s) == "24.04" ]]; then
-    # Ubuntu 24.04 LTS
-    sudo apt install wkhtmltopdf -y
-  else
-      # For older versions of Ubuntu
-    sudo gdebi --n `basename $_url`
+  for _codename in $WKHTMLTOPDF_CODENAMES; do
+    _url="${WKHTMLTOPDF_BASE}/wkhtmltox_${WKHTMLTOPDF_VERSION}.${_codename}_${_arch}.deb"
+    echo "  trying ${_url}"
+    if sudo wget -q "$_url" -O /tmp/wkhtmltox.deb; then
+      # apt-get resolves the dependencies itself; gdebi is not installed on
+      # every release and adds nothing here.
+      if sudo apt-get install -y /tmp/wkhtmltox.deb; then
+        _wkhtml_ok="True"
+      fi
+    fi
+    sudo rm -f /tmp/wkhtmltox.deb
+    [ "$_wkhtml_ok" = "True" ] && break
+  done
+
+  if [ "$_wkhtml_ok" != "True" ]; then
+    echo "  no official build available, falling back to the distribution package"
+    sudo apt-get install -y wkhtmltopdf && _wkhtml_ok="True"
   fi
-  
-  sudo ln -s /usr/local/bin/wkhtmltopdf /usr/bin
-  sudo ln -s /usr/local/bin/wkhtmltoimage /usr/bin
+
+  # Link only what actually exists. The previous version created these
+  # unconditionally, so a failed download left dangling symlinks in /usr/bin
+  # that made wkhtmltopdf look installed while every PDF report failed with
+  # "You need Wkhtmltopdf to print a pdf version of the reports".
+  for _bin in wkhtmltopdf wkhtmltoimage; do
+    if [ -x "/usr/local/bin/${_bin}" ] && [ ! -e "/usr/bin/${_bin}" ]; then
+      sudo ln -s "/usr/local/bin/${_bin}" "/usr/bin/${_bin}"
+    fi
+  done
+
+  if [ "$_wkhtml_ok" = "True" ] && command -v wkhtmltopdf >/dev/null 2>&1; then
+    echo "  installed: $(wkhtmltopdf --version 2>&1 | head -n1)"
+  else
+    echo "  WARNING: wkhtmltopdf could not be installed. Odoo will start, but"
+    echo "           every PDF report (invoices included) will fail."
+  fi
 else
   echo "Wkhtmltopdf isn't installed due to the choice of the user!"
 fi
@@ -225,13 +275,13 @@ if [ $GENERATE_RANDOM_PASSWORD = "True" ]; then
     OE_SUPERADMIN=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
 fi
 sudo su root -c "printf 'admin_passwd = ${OE_SUPERADMIN}\n' >> /etc/${OE_CONFIG}.conf"
-if [ $OE_VERSION > "11.0" ];then
+if version_gt "$OE_VERSION" "11.0"; then
     sudo su root -c "printf 'http_port = ${OE_PORT}\n' >> /etc/${OE_CONFIG}.conf"
 else
     sudo su root -c "printf 'xmlrpc_port = ${OE_PORT}\n' >> /etc/${OE_CONFIG}.conf"
 fi
 
-if [ $OE_VERSION > "15.0" ];then
+if version_gt "$OE_VERSION" "15.0"; then
     sudo su root -c "printf 'gevent_port = ${LONGPOLLING_PORT}\n' >> /etc/${OE_CONFIG}.conf"
 else
     sudo su root -c "printf 'longpolling_port = ${LONGPOLLING_PORT}\n' >> /etc/${OE_CONFIG}.conf"
@@ -244,6 +294,35 @@ if [ $IS_ENTERPRISE = "True" ]; then
 else
     sudo su root -c "printf 'addons_path=${OE_HOME_EXT}/addons,${OE_HOME}/custom/addons\n' >> /etc/${OE_CONFIG}.conf"
 fi
+
+# Multiprocessing. Odoo defaults to workers = 0, which is a single-threaded
+# process: one slow request blocks every other user, and longpolling/websockets
+# share that same process. Any production instance wants workers > 0.
+# Odoo's documented rule is (cores * 2) + 1, but that is a CPU ceiling only.
+# Cap it by RAM as well: budget ~1 GB per worker and reserve 4 GB for the OS
+# and PostgreSQL, which usually shares the box. This errs high for busy
+# instances -- pin OE_WORKERS to a number if you want to be conservative.
+if [ "$OE_WORKERS" = "auto" ]; then
+    _cores=$(nproc 2>/dev/null || echo 1)
+    _ram_gb=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}')
+    _ram_gb=${_ram_gb:-2}
+    _by_cpu=$(( _cores * 2 + 1 ))
+    _by_ram=$(( _ram_gb > 5 ? _ram_gb - 4 : 1 ))
+    OE_WORKERS=$(( _by_cpu < _by_ram ? _by_cpu : _by_ram ))
+    echo "* Sizing workers: ${_cores} cores, ${_ram_gb}GB RAM -> workers = ${OE_WORKERS}"
+fi
+sudo su root -c "printf 'workers = ${OE_WORKERS}\n' >> /etc/${OE_CONFIG}.conf"
+
+# Serve exactly one database and hide the database manager. Without this, the
+# instance exposes /web/database/manager to the internet, where the master
+# password is the only thing between a visitor and dropping or downloading
+# every database on the server.
+if [ "$LOCK_DATABASE" = "True" ] && [ -n "$OE_DB_NAME" ]; then
+    sudo su root -c "printf 'db_name = ${OE_DB_NAME}\n' >> /etc/${OE_CONFIG}.conf"
+    sudo su root -c "printf 'dbfilter = ^${OE_DB_NAME}\$\n' >> /etc/${OE_CONFIG}.conf"
+    sudo su root -c "printf 'list_db = False\n' >> /etc/${OE_CONFIG}.conf"
+fi
+
 sudo chown $OE_USER:$OE_USER /etc/${OE_CONFIG}.conf
 sudo chmod 640 /etc/${OE_CONFIG}.conf
 
@@ -363,7 +442,7 @@ if [ $INSTALL_NGINX = "True" ]; then
   echo -e "\n---- Installing and setting up Nginx ----"
   sudo apt-get install -y nginx
 
-  if [ $OE_VERSION > "15.0" ];then
+  if version_gt "$OE_VERSION" "15.0"; then
     cat <<EOF > ~/odoo
 upstream $OE_USER {
   server 127.0.0.1:$OE_PORT;
@@ -380,6 +459,17 @@ map \$http_upgrade \$connection_upgrade {
 server {
   listen 80;
   server_name $WEBSITE_NAME;
+
+  # Odoo uploads (attachments, imports, backups) exceed nginx's 1M default.
+  client_max_body_size 1000M;
+  client_body_buffer_size 1M;     # avoid excessive disk buffering on medium uploads
+
+  # A WebSocket is a long-lived idle connection: with nginx's 60s default
+  # proxy_read_timeout it is dropped roughly every minute and the client
+  # reconnects in a loop. These also cover slow report/import requests.
+  proxy_read_timeout 720s;
+  proxy_send_timeout 720s;
+  proxy_connect_timeout 720s;
 #   rewrite ^(.*) https://\$host\$1 permanent;
 # }
 
@@ -405,6 +495,11 @@ server {
   # Redirect websocket requests to odoo gevent port
   location /websocket {
     proxy_pass http://$OE_USER-chat;
+    # Required: nginx proxies to upstreams with HTTP/1.0 by default, and the
+    # WebSocket Upgrade handshake only exists in HTTP/1.1. Without this the
+    # upgrade is refused and Odoo's bus never connects -- chat, live
+    # discussions and real-time notifications silently stop working.
+    proxy_http_version 1.1;
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection \$connection_upgrade;
     proxy_set_header X-Forwarded-Host \$http_host;
