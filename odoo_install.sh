@@ -609,7 +609,9 @@ EOF
 
   sudo mv ~/odoo /etc/nginx/sites-available/$WEBSITE_NAME
   sudo ln -s /etc/nginx/sites-available/$WEBSITE_NAME /etc/nginx/sites-enabled/$WEBSITE_NAME
-  sudo rm /etc/nginx/sites-enabled/default
+  # -f: on a host that already carries another Odoo instance the default site
+  # was removed by the first run, and a bare rm fails noisily for nothing.
+  sudo rm -f /etc/nginx/sites-enabled/default
   sudo service nginx reload
   sudo su root -c "printf 'proxy_mode = True\n' >> /etc/${OE_CONFIG}.conf"
   echo "Done! The Nginx server is up and running. Configuration can be found at /etc/nginx/sites-available/$WEBSITE_NAME"
@@ -627,9 +629,20 @@ if [ $INSTALL_NGINX = "True" ] && [ $ENABLE_SSL = "True" ] && [ $ADMIN_EMAIL != 
   sudo snap install core; snap refresh core
   sudo snap install --classic certbot
   sudo apt-get install python3-certbot-nginx -y
-  sudo certbot --nginx -d $WEBSITE_NAME --noninteractive --agree-tos --email $ADMIN_EMAIL --redirect
-  sudo service nginx reload
-  echo "SSL/HTTPS is enabled!"
+  # Report what actually happened. Certbot exits non-zero when the ACME
+  # challenge fails -- typically because DNS does not point here yet, or points
+  # here over A but not AAAA -- and announcing success regardless leaves the
+  # site on plain HTTP while the log says it is secured.
+  if sudo certbot --nginx -d $WEBSITE_NAME --noninteractive --agree-tos --email $ADMIN_EMAIL --redirect; then
+    sudo service nginx reload
+    echo "SSL/HTTPS is enabled!"
+  else
+    sudo service nginx reload
+    echo "WARNING: certbot could not issue a certificate for $WEBSITE_NAME."
+    echo "         The site is serving plain HTTP. Check that every A and AAAA"
+    echo "         record for $WEBSITE_NAME resolves to this host, then re-run:"
+    echo "           sudo certbot --nginx -d $WEBSITE_NAME --agree-tos --email $ADMIN_EMAIL --redirect"
+  fi
 else
   echo "SSL/HTTPS isn't enabled due to choice of the user or because of a misconfiguration!"
   if [ "$ADMIN_EMAIL" = "odoo@example.com" ]; then
@@ -641,8 +654,17 @@ else
   fi
 fi
 
-echo -e "* Starting Odoo Service"
-sudo su root -c "/etc/init.d/$OE_CONFIG start"
+# The service is a systemd unit named after $OE_USER and was already started
+# by `systemctl enable --now` above. This used to run
+# `/etc/init.d/$OE_CONFIG start`, a leftover from the SysV era (that init
+# script is commented out further up), so it could only ever print
+# "No such file or directory" -- alarming, and misleading, since the server was
+# in fact already running.
+echo -e "* Odoo service status"
+sudo systemctl --no-pager --lines=0 status "$OE_USER" 2>/dev/null | head -n 3 || true
+if ! sudo systemctl is-active --quiet "$OE_USER"; then
+    echo "WARNING: $OE_USER.service is not running. Check: journalctl -u $OE_USER -n 50"
+fi
 echo "-----------------------------------------------------------"
 echo "Done! The Odoo server is up and running. Specifications:"
 echo "Port: $OE_PORT"
@@ -650,12 +672,14 @@ echo "User service: $OE_USER"
 echo "Configuraton file location: /etc/${OE_CONFIG}.conf"
 echo "Logfile location: /var/log/$OE_USER"
 echo "User PostgreSQL: $OE_USER"
-echo "Code location: $OE_USER"
-echo "Addons folder: $OE_USER/$OE_CONFIG/addons/"
+echo "Code location: $OE_HOME_EXT"
+echo "Addons folder: $OE_HOME_EXT/addons/"
+echo "Custom addons folder: $OE_HOME/custom/addons/"
 echo "Password superadmin (database): $OE_SUPERADMIN"
-echo "Start Odoo service: sudo service $OE_CONFIG start"
-echo "Stop Odoo service: sudo service $OE_CONFIG stop"
-echo "Restart Odoo service: sudo service $OE_CONFIG restart"
+# The unit is $OE_USER.service, not $OE_CONFIG -- see the systemd block above.
+echo "Start Odoo service: sudo systemctl start $OE_USER"
+echo "Stop Odoo service: sudo systemctl stop $OE_USER"
+echo "Restart Odoo service: sudo systemctl restart $OE_USER"
 if [ $INSTALL_NGINX = "True" ]; then
   echo "Nginx configuration file: /etc/nginx/sites-available/$WEBSITE_NAME"
 fi
