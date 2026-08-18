@@ -36,8 +36,17 @@ OE_SUPERADMIN="admin"
 # Set to "True" to generate a random password, "False" to use the variable in OE_SUPERADMIN
 GENERATE_RANDOM_PASSWORD="True"
 OE_CONFIG="${OE_USER}-server"
-# Set the website name
+# Set the website name. Accepts several space-separated names -- every one is
+# put in nginx's server_name and included in the certificate, e.g.
+#   WEBSITE_NAME="example.sk www.example.sk example.eu www.example.eu"
+# The first name is the primary: it names the vhost file and the certificate.
 WEBSITE_NAME="_"
+# Clone Odoo's design themes (public repo) and add them to the addons path.
+INSTALL_DESIGN_THEMES="True"
+# Install a catch-all nginx vhost that refuses hostnames no site claims.
+# Strongly recommended when a host serves more than one domain, and required
+# if any wildcard DNS record points here -- see the block that installs it.
+INSTALL_DEFAULT_DENY="True"
 # Set the default Odoo longpolling port (you still have to use -c /etc/odoo-server.conf for example to use this.)
 LONGPOLLING_PORT="8072"
 # Number of Odoo worker processes. "auto" sizes it from CPU count and RAM;
@@ -73,6 +82,16 @@ pip_install() {
 version_gt() {
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
 }
+
+# WEBSITE_NAME may list several names. nginx takes them all in server_name as
+# they are, but the vhost filename and certbot need handling:
+#   WEBSITE_PRIMARY  - first name; names the vhost file and the certificate
+#   CERTBOT_DOMAINS  - "-d a -d b -d c ..." for certbot
+WEBSITE_PRIMARY=$(set -- $WEBSITE_NAME; echo "$1")
+CERTBOT_DOMAINS=""
+for _d in $WEBSITE_NAME; do
+    CERTBOT_DOMAINS="$CERTBOT_DOMAINS -d $_d"
+done
 ##
 ###  WKHTMLTOPDF download links
 ## === Ubuntu Trusty x64 & x32 === (for other distributions please replace these two links,
@@ -257,6 +276,23 @@ if [ $IS_ENTERPRISE = "True" ]; then
     sudo npm install -g less-plugin-clean-css
 fi
 
+if [ "$INSTALL_DESIGN_THEMES" = "True" ]; then
+    echo -e "\n---- Installing Odoo design themes ----"
+    # Public repo, so no credentials needed -- unlike odoo/enterprise above.
+    # Roughly 300 MB even shallow, which is why it is optional.
+    if [ -d "$OE_HOME/design-themes/.git" ]; then
+        echo "  already present at $OE_HOME/design-themes, skipping"
+    elif sudo git clone --depth 1 --branch $OE_VERSION \
+            https://github.com/odoo/design-themes "$OE_HOME/design-themes"; then
+        sudo chown -R $OE_USER:$OE_USER "$OE_HOME/design-themes"
+        echo "  themes available: $(ls -1 "$OE_HOME/design-themes" | wc -l)"
+    else
+        echo "  WARNING: could not clone odoo/design-themes for branch $OE_VERSION."
+        echo "           Continuing without them; the addons path will omit the directory."
+        INSTALL_DESIGN_THEMES="False"
+    fi
+fi
+
 echo -e "\n---- Create custom module directory ----"
 sudo su $OE_USER -c "mkdir $OE_HOME/custom"
 sudo su $OE_USER -c "mkdir $OE_HOME/custom/addons"
@@ -289,11 +325,18 @@ fi
 
 sudo su root -c "printf 'logfile = /var/log/${OE_USER}/${OE_CONFIG}.log\n' >> /etc/${OE_CONFIG}.conf"
 
+# Build the addons path once rather than duplicating it per branch. Note the
+# enterprise branch previously omitted ${OE_HOME}/custom/addons entirely, so an
+# enterprise install could not load any custom module -- it is included for
+# both now.
+ODOO_ADDONS_PATH="${OE_HOME_EXT}/addons,${OE_HOME}/custom/addons"
 if [ $IS_ENTERPRISE = "True" ]; then
-    sudo su root -c "printf 'addons_path=${OE_HOME}/enterprise/addons,${OE_HOME_EXT}/addons\n' >> /etc/${OE_CONFIG}.conf"
-else
-    sudo su root -c "printf 'addons_path=${OE_HOME_EXT}/addons,${OE_HOME}/custom/addons\n' >> /etc/${OE_CONFIG}.conf"
+    ODOO_ADDONS_PATH="${OE_HOME}/enterprise/addons,${ODOO_ADDONS_PATH}"
 fi
+if [ "$INSTALL_DESIGN_THEMES" = "True" ]; then
+    ODOO_ADDONS_PATH="${ODOO_ADDONS_PATH},${OE_HOME}/design-themes"
+fi
+sudo su root -c "printf 'addons_path=${ODOO_ADDONS_PATH}\n' >> /etc/${OE_CONFIG}.conf"
 
 # Multiprocessing. Odoo defaults to workers = 0, which is a single-threaded
 # process: one slow request blocks every other user, and longpolling/websockets
@@ -607,14 +650,50 @@ server {
 EOF
   fi
 
-  sudo mv ~/odoo /etc/nginx/sites-available/$WEBSITE_NAME
-  sudo ln -s /etc/nginx/sites-available/$WEBSITE_NAME /etc/nginx/sites-enabled/$WEBSITE_NAME
+  sudo mv ~/odoo /etc/nginx/sites-available/$WEBSITE_PRIMARY
+  sudo ln -sfn /etc/nginx/sites-available/$WEBSITE_PRIMARY /etc/nginx/sites-enabled/$WEBSITE_PRIMARY
   # -f: on a host that already carries another Odoo instance the default site
   # was removed by the first run, and a bare rm fails noisily for nothing.
   sudo rm -f /etc/nginx/sites-enabled/default
-  sudo service nginx reload
+
+  if [ "$INSTALL_DEFAULT_DENY" = "True" ]; then
+    # Without an explicit default_server, nginx promotes the FIRST-loaded vhost
+    # to that role, so any hostname pointed at this box that no site claims is
+    # served -- and possibly redirected -- by whichever site sorts first. On a
+    # host with two instances that means one client's domain answering with
+    # another client's site, and it is guaranteed to happen the moment a
+    # wildcard DNS record (*.example.com) points here.
+    sudo tee /etc/nginx/sites-available/000-default-deny > /dev/null <<'NGINXDENY'
+# Catch-all for hostnames that no vhost claims. Reject rather than let a name
+# fall through to an unrelated site. A new hostname works only once it is
+# deliberately given a vhost.
+server {
+    listen 80 default_server;
+    server_name _;
+    # 444: close without a response; nothing legitimate arrives here.
+    return 444;
+}
+
+server {
+    listen 443 ssl default_server;
+    server_name _;
+    # nginx >= 1.19.4: refuse the handshake for unknown SNI instead of
+    # presenting an unrelated domain's certificate.
+    ssl_reject_handshake on;
+}
+NGINXDENY
+    if nginx -v 2>&1 | grep -qE 'nginx/1\.(1[0-9]|[0-9])\.'; then
+      # ssl_reject_handshake needs >= 1.19.4; drop the TLS half on older nginx
+      # rather than fail the whole config test.
+      sudo sed -i '/listen 443 ssl default_server;/,$d' /etc/nginx/sites-available/000-default-deny
+      echo "  nginx too old for ssl_reject_handshake; installed the HTTP catch-all only"
+    fi
+    sudo ln -sfn /etc/nginx/sites-available/000-default-deny /etc/nginx/sites-enabled/000-default-deny
+  fi
+
+  sudo nginx -t && sudo service nginx reload
   sudo su root -c "printf 'proxy_mode = True\n' >> /etc/${OE_CONFIG}.conf"
-  echo "Done! The Nginx server is up and running. Configuration can be found at /etc/nginx/sites-available/$WEBSITE_NAME"
+  echo "Done! The Nginx server is up and running. Configuration can be found at /etc/nginx/sites-available/$WEBSITE_PRIMARY"
 else
   echo "Nginx isn't installed due to choice of the user!"
 fi
@@ -633,7 +712,7 @@ if [ $INSTALL_NGINX = "True" ] && [ $ENABLE_SSL = "True" ] && [ $ADMIN_EMAIL != 
   # challenge fails -- typically because DNS does not point here yet, or points
   # here over A but not AAAA -- and announcing success regardless leaves the
   # site on plain HTTP while the log says it is secured.
-  if sudo certbot --nginx -d $WEBSITE_NAME --noninteractive --agree-tos --email $ADMIN_EMAIL --redirect; then
+  if sudo certbot --nginx $CERTBOT_DOMAINS --cert-name $WEBSITE_PRIMARY --noninteractive --agree-tos --email $ADMIN_EMAIL --redirect; then
     sudo service nginx reload
     echo "SSL/HTTPS is enabled!"
   else
@@ -641,7 +720,7 @@ if [ $INSTALL_NGINX = "True" ] && [ $ENABLE_SSL = "True" ] && [ $ADMIN_EMAIL != 
     echo "WARNING: certbot could not issue a certificate for $WEBSITE_NAME."
     echo "         The site is serving plain HTTP. Check that every A and AAAA"
     echo "         record for $WEBSITE_NAME resolves to this host, then re-run:"
-    echo "           sudo certbot --nginx -d $WEBSITE_NAME --agree-tos --email $ADMIN_EMAIL --redirect"
+    echo "           sudo certbot --nginx $CERTBOT_DOMAINS --cert-name $WEBSITE_PRIMARY --agree-tos --email $ADMIN_EMAIL --redirect"
   fi
 else
   echo "SSL/HTTPS isn't enabled due to choice of the user or because of a misconfiguration!"
@@ -681,6 +760,6 @@ echo "Start Odoo service: sudo systemctl start $OE_USER"
 echo "Stop Odoo service: sudo systemctl stop $OE_USER"
 echo "Restart Odoo service: sudo systemctl restart $OE_USER"
 if [ $INSTALL_NGINX = "True" ]; then
-  echo "Nginx configuration file: /etc/nginx/sites-available/$WEBSITE_NAME"
+  echo "Nginx configuration file: /etc/nginx/sites-available/$WEBSITE_PRIMARY"
 fi
 echo "-----------------------------------------------------------"
