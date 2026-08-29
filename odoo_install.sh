@@ -58,6 +58,23 @@ LOCK_DATABASE="True"
 # The database this instance serves. Used for db_name/dbfilter when
 # LOCK_DATABASE is True; leave empty to skip the restriction.
 OE_DB_NAME="$OE_USER"
+# Create the Odoo PostgreSQL role as a cluster SUPERUSER. Leave this "False".
+#
+# A superuser bypasses every permission check in the CLUSTER, not merely in this
+# instance's database: it can read and write every other database on the server,
+# run COPY ... FROM PROGRAM (arbitrary shell as the postgres OS user) and read
+# any file postgres can. This role's password sits in /etc/${OE_CONFIG}.conf, so
+# with the flag set, any code execution through Odoo -- a module bug, an unsafe
+# server action, a hostile third-party addon -- escalates to the whole server.
+#
+# Odoo does not need it. CREATEDB is enough to create and manage its own
+# databases, and nothing else is lost: pg_trgm and unaccent are TRUSTED
+# extensions on PostgreSQL 13+, so the database owner installs them without
+# superuser; pgvector is not trusted, but it is created into template1 as
+# postgres further down, so new databases inherit it; and Odoo's extension
+# creation is wrapped in try/except anyway (odoo/service/db.py) -- it warns,
+# it does not fail.
+DB_ROLE_SUPERUSER="False"
 # Set to "True" to install certbot and have ssl enabled, "False" to use http
 ENABLE_SSL="True"
 # Provide Email to register ssl certificate
@@ -162,7 +179,45 @@ fi
 
 
 echo -e "\n---- Creating the ODOO PostgreSQL User  ----"
-sudo su - postgres -c "createuser -s $OE_USER" 2> /dev/null || true
+# See DB_ROLE_SUPERUSER at the top of this script for why -s is not the default.
+if [ "$DB_ROLE_SUPERUSER" = "True" ]; then
+    echo "* WARNING: creating $OE_USER as a PostgreSQL SUPERUSER (cluster-wide access)"
+    sudo su - postgres -c "createuser -s $OE_USER" 2> /dev/null || true
+else
+    sudo su - postgres -c "createuser --createdb $OE_USER" 2> /dev/null || true
+fi
+
+# The role may predate this script, or a previous run of it. Report that rather
+# than silently changing it -- revoking superuser under a running instance is
+# the operator's call, not the installer's.
+_rolsuper=$(sudo su - postgres -c \
+    "psql -tAc \"SELECT rolsuper FROM pg_roles WHERE rolname='$OE_USER'\"" 2>/dev/null || true)
+if [ "$DB_ROLE_SUPERUSER" != "True" ] && [ "$_rolsuper" = "t" ]; then
+    echo "* NOTE: PostgreSQL role '$OE_USER' already existed and IS a superuser."
+    echo "*       This installer did not change it. To drop the privilege:"
+    echo "*           sudo -u postgres psql -c \"ALTER ROLE $OE_USER NOSUPERUSER;\""
+    echo "*       Do that on a staging instance first."
+fi
+unset _rolsuper
+
+# Odoo runs "ALTER FUNCTION unaccent(text) IMMUTABLE" when unaccent = True, and
+# needs it: without IMMUTABLE, indexes over unaccent() cannot be built. But a
+# TRUSTED extension created by a non-superuser is owned by postgres, so that
+# ALTER fails with "must be owner of function unaccent" -- silently, because
+# Odoo wraps the whole block in try/except and only logs a warning.
+#
+# So seed it into template1 as postgres, the same way pgvector is handled above.
+# Every database Odoo subsequently creates inherits both the extension and the
+# IMMUTABLE marking, and the Odoo role never needs superuser for it.
+if [ "$DB_ROLE_SUPERUSER" != "True" ]; then
+    echo -e "\n---- Seeding unaccent into template1 (needed by non-superuser roles) ----"
+    sudo systemctl start postgresql || true
+    until sudo -u postgres pg_isready >/dev/null 2>&1; do sleep 1; done
+    sudo -u postgres psql -q -d template1 <<'SQL' || echo "* NOTE: could not seed unaccent; set unaccent = False in the Odoo config"
+CREATE EXTENSION IF NOT EXISTS unaccent;
+ALTER FUNCTION unaccent(text) IMMUTABLE;
+SQL
+fi
 
 #--------------------------------------------------
 # Install Dependencies
